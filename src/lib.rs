@@ -324,4 +324,229 @@ mod tests {
             );
         }
     }
+
+    // --- ECC boundary lengths (stress RS code word boundaries) ---
+
+    #[test]
+    fn test_roundtrip_ecc_boundaries() {
+        // These lengths trigger ECC byte count transitions:
+        // len=3 -> 2 ECC, len=4 -> 4 ECC, len=5 -> 4 ECC,
+        // len=10 -> 4 ECC, len=15 -> 6 ECC, len=25 -> 10 ECC
+        let test_lengths = [3, 4, 5, 10, 15, 25, 50, 100, 140];
+        for &len in &test_lengths {
+            let payload: Vec<u8> = (0..len).map(|i| ((i * 7 + 13) % 256) as u8).collect();
+            let audio = encode(&payload, 50).unwrap();
+            let mut decoder = Decoder::new();
+            let result = decoder.decode(&audio).unwrap();
+            assert_eq!(
+                result.as_deref(),
+                Some(&payload[..]),
+                "ECC boundary round-trip failed for length {len}"
+            );
+        }
+    }
+
+    // --- All same byte values (degenerate payloads) ---
+
+    #[test]
+    fn test_roundtrip_all_zeros() {
+        let payload = vec![0u8; 16];
+        let audio = encode(&payload, 50).unwrap();
+        let mut decoder = Decoder::new();
+        let result = decoder.decode(&audio).unwrap();
+        assert_eq!(result.as_deref(), Some(&payload[..]));
+    }
+
+    #[test]
+    fn test_roundtrip_all_ones() {
+        let payload = vec![0xFFu8; 16];
+        let audio = encode(&payload, 50).unwrap();
+        let mut decoder = Decoder::new();
+        let result = decoder.decode(&audio).unwrap();
+        assert_eq!(result.as_deref(), Some(&payload[..]));
+    }
+
+    // --- Decoder handles silence without panicking ---
+
+    #[test]
+    fn test_decode_silence_returns_none() {
+        let silence = vec![0.0f32; 48000]; // 1 second of silence
+        let mut decoder = Decoder::new();
+        let result = decoder.decode(&silence).unwrap();
+        assert_eq!(result, None, "silence should produce None, not a decode");
+    }
+
+    // --- Decoder handles random noise without panicking ---
+
+    #[test]
+    fn test_decode_random_noise_no_panic() {
+        let mut rng_state: u32 = 99999;
+        let noise: Vec<f32> = (0..48000)
+            .map(|_| {
+                rng_state = rng_state.wrapping_mul(1103515245).wrapping_add(12345);
+                let f = (rng_state >> 16) as f32 / 65535.0;
+                (f - 0.5) * 2.0
+            })
+            .collect();
+        let mut decoder = Decoder::new();
+        // Should not panic — either returns None or an error
+        let _ = decoder.decode(&noise);
+    }
+
+    // --- Multiple sequential decodes on one decoder instance ---
+
+    #[test]
+    fn test_sequential_decodes() {
+        let payloads: &[&[u8]] = &[b"first", b"second", b"third"];
+        let mut decoder = Decoder::new();
+        for payload in payloads {
+            let audio = encode(payload, 50).unwrap();
+            decoder.reset();
+            let result = decoder.decode(&audio).unwrap();
+            assert_eq!(
+                result.as_deref(),
+                Some(*payload),
+                "sequential decode failed for {:?}",
+                String::from_utf8_lossy(payload)
+            );
+        }
+    }
+
+    // --- Volume sweep: ensure round-trip works at various volumes ---
+
+    #[test]
+    fn test_roundtrip_volume_sweep() {
+        let payload = b"volume test";
+        for volume in [1, 5, 10, 25, 50, 75, 100] {
+            let audio = encode(payload, volume).unwrap();
+            let mut decoder = Decoder::new();
+            let result = decoder.decode(&audio).unwrap();
+            assert_eq!(
+                result.as_deref(),
+                Some(&payload[..]),
+                "round-trip failed at volume {volume}"
+            );
+        }
+    }
+
+    // --- Encode determinism: same input → same output ---
+
+    #[test]
+    fn test_encode_deterministic() {
+        let payload = b"deterministic";
+        let audio1 = encode(payload, 50).unwrap();
+        let audio2 = encode(payload, 50).unwrap();
+        assert_eq!(audio1.len(), audio2.len());
+        for (i, (a, b)) in audio1.iter().zip(audio2.iter()).enumerate() {
+            assert_eq!(a, b, "sample {i} differs between two encodes");
+        }
+    }
+
+    // --- Decode audio with trailing garbage after end marker ---
+
+    #[test]
+    fn test_roundtrip_with_trailing_noise() {
+        let payload = b"trail";
+        let mut audio = encode(payload, 50).unwrap();
+
+        // Append 1 second of random noise after the signal
+        let mut rng_state: u32 = 77777;
+        let noise: Vec<f32> = (0..48000)
+            .map(|_| {
+                rng_state = rng_state.wrapping_mul(1103515245).wrapping_add(12345);
+                let f = (rng_state >> 16) as f32 / 65535.0;
+                (f - 0.5) * 0.5
+            })
+            .collect();
+        audio.extend_from_slice(&noise);
+
+        let mut decoder = Decoder::new();
+        let result = decoder.decode(&audio).unwrap();
+        assert_eq!(result.as_deref(), Some(&payload[..]));
+    }
+
+    // --- Decode with both leading silence and trailing noise ---
+
+    #[test]
+    fn test_roundtrip_padded_both_sides() {
+        let payload = b"padded";
+        let audio = encode(payload, 50).unwrap();
+
+        let mut padded = vec![0.0f32; 24000]; // 0.5s leading silence
+        padded.extend_from_slice(&audio);
+        // 0.5s trailing silence
+        padded.extend(vec![0.0f32; 24000]);
+
+        let mut decoder = Decoder::new();
+        let result = decoder.decode(&padded).unwrap();
+        assert_eq!(result.as_deref(), Some(&payload[..]));
+    }
+
+    // --- Back-to-back messages without reset (decoder should find first) ---
+
+    #[test]
+    fn test_back_to_back_messages() {
+        let payload1 = b"msg1";
+        let payload2 = b"msg2";
+        let audio1 = encode(payload1, 50).unwrap();
+        let audio2 = encode(payload2, 50).unwrap();
+
+        let mut combined = audio1;
+        // Small gap between messages
+        combined.extend(vec![0.0f32; 4096]);
+        combined.extend_from_slice(&audio2);
+
+        let mut decoder = Decoder::new();
+        let result1 = decoder.decode(&combined).unwrap();
+        assert_eq!(
+            result1.as_deref(),
+            Some(&payload1[..]),
+            "first message not decoded"
+        );
+    }
+
+    // --- Payload at every byte value in a single byte ---
+
+    #[test]
+    fn test_roundtrip_every_single_byte_value() {
+        // Stress-test all 256 possible single-byte payloads
+        for b in 0..=255u8 {
+            let payload = [b];
+            let audio = encode(&payload, 50).unwrap();
+            let mut decoder = Decoder::new();
+            let result = decoder.decode(&audio).unwrap();
+            assert_eq!(
+                result.as_deref(),
+                Some(&payload[..]),
+                "single-byte round-trip failed for byte 0x{b:02X}"
+            );
+        }
+    }
+
+    // --- Sample count matches for boundary payload sizes ---
+
+    #[test]
+    fn test_encode_sample_counts_consistent() {
+        // Verify the output length formula holds for various sizes
+        for size in [1, 2, 3, 4, 5, 10, 15, 25, 50, 100, 140] {
+            let payload: Vec<u8> = (0..size).map(|i| (i % 256) as u8).collect();
+            let audio = encode(&payload, 50).unwrap();
+
+            let n_ecc = protocol::ecc_bytes_for_length(size);
+            let total_bytes = protocol::ENCODED_DATA_OFFSET + size + n_ecc;
+            let total_data_frames = protocol::EXTRA
+                * ((total_bytes + protocol::BYTES_PER_TX - 1) / protocol::BYTES_PER_TX)
+                * protocol::FRAMES_PER_TX;
+            let expected = (protocol::N_MARKER_FRAMES + total_data_frames + protocol::N_MARKER_FRAMES)
+                * protocol::SAMPLES_PER_FRAME;
+
+            assert_eq!(
+                audio.len(),
+                expected,
+                "sample count mismatch for payload size {size}: got {} expected {}",
+                audio.len(),
+                expected
+            );
+        }
+    }
 }
