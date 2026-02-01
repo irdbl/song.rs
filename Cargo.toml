@@ -1,8 +1,8 @@
 [package]
-name = "ggwave"
+name = "ggwave-voice"
 version = "0.1.0"
 edition = "2021"
-description = "Rust port of ggwave AUDIBLE_FAST codec — encode text to audio and decode audio to text at 48kHz"
+description = "Voice-formant FSK codec — encode data as vowel-like audio that survives noise cancellation"
 license = "MIT"
 
 [dependencies]
@@ -12,6 +12,7 @@ thiserror = "2"
 [dev-dependencies]
 hound = "3"
 criterion = { version = "0.5", features = ["html_reports"] }
+nnnoiseless = "0.5"
 
 [[bench]]
 name = "bandwidth"

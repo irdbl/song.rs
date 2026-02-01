@@ -212,7 +212,10 @@ fn find_error_locator(synd: &[u8], ecc_length: usize, erase_count: usize) -> Opt
     let err_loc = err_loc[shift..].to_vec();
 
     let errs = err_loc.len() - 1;
-    if (errs - erase_count) * 2 + erase_count > ecc_length {
+    // Budget: each unknown error costs 2, each erasure costs 1.
+    // When using Forney syndromes, errs already excludes erasures,
+    // so the check is simply errs*2 + erase_count.
+    if errs * 2 + erase_count > ecc_length {
         return None;
     }
 
@@ -383,6 +386,16 @@ impl ReedSolomon {
     /// Decode: takes `msg_length + ecc_length` bytes, returns decoded message.
     /// Returns `None` if correction fails.
     pub fn decode(&self, encoded: &[u8]) -> Option<Vec<u8>> {
+        self.decode_with_erasures(encoded, &[])
+    }
+
+    /// Decode with known erasure positions (byte indices into the encoded block).
+    ///
+    /// Erasures are positions where the symbol confidence was too low to trust.
+    /// Each erasure costs 1 ECC symbol (vs 2 for an unknown error), so providing
+    /// erasure positions lets RS correct more total damage.
+    /// Returns `None` if correction fails.
+    pub fn decode_with_erasures(&self, encoded: &[u8], erase_pos: &[usize]) -> Option<Vec<u8>> {
         assert_eq!(encoded.len(), self.msg_length + self.ecc_length);
 
         let src_len = self.msg_length + self.ecc_length;
@@ -396,10 +409,13 @@ impl ReedSolomon {
             return Some(encoded[..self.msg_length].to_vec());
         }
 
-        // No erasures in our use case
-        let erase_pos: Vec<usize> = Vec::new();
+        // Budget check: erasures alone must not exceed ECC capacity
+        if erase_pos.len() > self.ecc_length {
+            return None;
+        }
 
-        let forney = calc_forney_syndromes(&synd, &erase_pos, src_len);
+        // Use Forney syndromes to find additional errors beyond known erasures
+        let forney = calc_forney_syndromes(&synd, erase_pos, src_len);
 
         let error_loc = find_error_locator(&forney, self.ecc_length, erase_pos.len())?;
 
@@ -408,15 +424,21 @@ impl ReedSolomon {
 
         let err = find_errors(&reloc, src_len)?;
 
-        if err.is_empty() {
+        // Combine erasure positions with found errors
+        let mut all_pos: Vec<usize> = erase_pos.to_vec();
+        all_pos.extend_from_slice(&err);
+
+        if all_pos.is_empty() {
             return None;
         }
 
-        // combine erasure positions with found errors
-        let mut all_pos = erase_pos;
-        all_pos.extend_from_slice(&err);
-
         let corrected = correct_errata(encoded, &synd, &all_pos);
+
+        // Verify correction
+        let verify_synd = calc_syndromes(&corrected, self.ecc_length);
+        if verify_synd.iter().any(|&s| s != 0) {
+            return None;
+        }
 
         Some(corrected[..self.msg_length].to_vec())
     }
@@ -508,5 +530,98 @@ mod tests {
 
         let decoded = rs.decode(&corrupted).unwrap();
         assert_eq!(&decoded, &msg[..]);
+    }
+
+    #[test]
+    fn test_rs_erasure_known_positions() {
+        let msg_len = 10;
+        let ecc_len = 6;
+        let rs = ReedSolomon::new(msg_len, ecc_len);
+        let msg: Vec<u8> = (0..msg_len as u8).collect();
+        let encoded = rs.encode(&msg);
+
+        // Corrupt 3 known positions (erasures cost 1 each, budget = 6)
+        let mut corrupted = encoded.clone();
+        corrupted[0] ^= 0xFF;
+        corrupted[4] ^= 0xAA;
+        corrupted[8] ^= 0x55;
+
+        // Without erasure info, 3 errors cost 6 ECC symbols — at the limit
+        // With erasure info, 3 erasures cost only 3 — plenty of room
+        let decoded = rs.decode_with_erasures(&corrupted, &[0, 4, 8]).unwrap();
+        assert_eq!(&decoded, &msg[..]);
+    }
+
+    #[test]
+    fn test_rs_erasure_plus_error() {
+        let msg_len = 10;
+        let ecc_len = 6;
+        let rs = ReedSolomon::new(msg_len, ecc_len);
+        let msg: Vec<u8> = (0..msg_len as u8).collect();
+        let encoded = rs.encode(&msg);
+
+        // 2 known erasures + 1 unknown error = 2 + 2 = 4 ECC symbols (within budget of 6)
+        let mut corrupted = encoded.clone();
+        corrupted[1] ^= 0xFF; // erasure
+        corrupted[5] ^= 0xAA; // erasure
+        corrupted[9] ^= 0x33; // unknown error
+
+        let decoded = rs.decode_with_erasures(&corrupted, &[1, 5]).unwrap();
+        assert_eq!(&decoded, &msg[..]);
+    }
+
+    #[test]
+    fn test_rs_erasure_budget_exceeded() {
+        let msg_len = 10;
+        let ecc_len = 4;
+        let rs = ReedSolomon::new(msg_len, ecc_len);
+        let msg: Vec<u8> = (0..msg_len as u8).collect();
+        let encoded = rs.encode(&msg);
+
+        // 5 erasures exceeds budget of 4
+        let mut corrupted = encoded.clone();
+        for i in 0..5 {
+            corrupted[i] ^= 0xFF;
+        }
+
+        let result = rs.decode_with_erasures(&corrupted, &[0, 1, 2, 3, 4]);
+        assert!(result.is_none(), "should fail when erasures exceed ECC budget");
+    }
+
+    #[test]
+    fn test_rs_erasure_more_correctable_than_errors() {
+        // Demonstrate erasures can fix what hard-decision cannot
+        let msg_len = 10;
+        let ecc_len = 4; // can fix 2 errors OR 4 erasures
+        let rs = ReedSolomon::new(msg_len, ecc_len);
+        let msg: Vec<u8> = (0..msg_len as u8).collect();
+        let encoded = rs.encode(&msg);
+
+        // 3 corrupted bytes — too many for hard-decision (needs 6 ECC, only have 4)
+        let mut corrupted = encoded.clone();
+        corrupted[2] ^= 0xDE;
+        corrupted[5] ^= 0xAD;
+        corrupted[7] ^= 0xBE;
+
+        // Hard-decision fails
+        assert!(rs.decode(&corrupted).is_none(), "hard-decision should fail with 3 errors and ecc=4");
+
+        // Erasure-aided succeeds (3 erasures cost 3, within budget of 4)
+        let decoded = rs.decode_with_erasures(&corrupted, &[2, 5, 7]).unwrap();
+        assert_eq!(&decoded, &msg[..]);
+    }
+
+    #[test]
+    fn test_rs_erasure_empty_is_same_as_decode() {
+        let rs = ReedSolomon::new(3, 4);
+        let msg = [0x01, 0x02, 0x03];
+        let encoded = rs.encode(&msg);
+
+        let mut corrupted = encoded.clone();
+        corrupted[1] ^= 0xFF;
+
+        let d1 = rs.decode(&corrupted).unwrap();
+        let d2 = rs.decode_with_erasures(&corrupted, &[]).unwrap();
+        assert_eq!(d1, d2);
     }
 }

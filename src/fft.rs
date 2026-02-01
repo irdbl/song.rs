@@ -1,57 +1,48 @@
-//! FFT wrapper around `rustfft` for computing power spectrum from real-valued audio.
+//! FFT wrapper around `rustfft` for computing power spectrum.
 
 use rustfft::{num_complex::Complex, FftPlanner};
+use std::f64::consts::PI;
 
-use crate::protocol::SAMPLES_PER_FRAME;
-
-/// Compute the power spectrum of a real-valued audio frame.
+/// Compute the Hann-windowed power spectrum of a real-valued audio frame.
 ///
-/// Input: `samples` of length `SAMPLES_PER_FRAME` (1024).
-/// Output: `spectrum` of length `SAMPLES_PER_FRAME / 2 + 1` (513) containing
-/// power (magnitude squared) at each bin.
+/// Input: `samples` of arbitrary length N.
+/// Output: `spectrum` of length >= N containing power (magnitude squared) at each bin.
 ///
-/// The C++ implementation computes:
-///   spectrum[i] = re[i]^2 + im[i]^2
-/// and then folds the negative frequencies:
-///   spectrum[i] += spectrum[N - i] for i in 1..N/2
-///
-/// We replicate that exactly.
+/// Applies a Hann window before FFT to reduce spectral leakage,
+/// then folds negative frequencies: spectrum[i] += spectrum[N - i] for i in 1..N/2.
 pub fn power_spectrum(samples: &[f32], spectrum: &mut [f32]) {
-    assert_eq!(samples.len(), SAMPLES_PER_FRAME);
-    assert!(spectrum.len() >= SAMPLES_PER_FRAME);
+    let n = samples.len();
+    assert!(spectrum.len() >= n);
 
-    let n = SAMPLES_PER_FRAME;
-
-    // Convert to complex
     let mut buffer: Vec<Complex<f32>> = samples
         .iter()
-        .map(|&s| Complex::new(s, 0.0))
+        .enumerate()
+        .map(|(i, &s)| {
+            let w = 0.5 * (1.0 - (2.0 * PI * i as f64 / n as f64).cos());
+            Complex::new(s * w as f32, 0.0)
+        })
         .collect();
 
-    // Perform FFT
     let mut planner = FftPlanner::new();
     let fft = planner.plan_fft_forward(n);
     fft.process(&mut buffer);
 
-    // Compute power: |X[k]|^2
     for i in 0..n {
         spectrum[i] = buffer[i].norm_sqr();
     }
 
-    // Fold negative frequencies: spectrum[i] += spectrum[N-i] for 1..N/2
     for i in 1..n / 2 {
         spectrum[i] += spectrum[n - i];
     }
 }
 
-/// Compute power spectrum from a windowed/averaged time-domain signal.
+/// Compute power spectrum without windowing (rectangular window).
 ///
-/// Same as `power_spectrum` but takes an arbitrary `&[f32]` slice and
-/// writes to a pre-allocated buffer. Used by the decoder for sub-frame analysis.
-pub fn power_spectrum_into(samples: &[f32], spectrum: &mut Vec<f32>) {
+/// More robust for preamble detection with misaligned windows,
+/// since all samples contribute equally regardless of position.
+pub fn power_spectrum_raw(samples: &[f32], spectrum: &mut [f32]) {
     let n = samples.len();
-    spectrum.clear();
-    spectrum.resize(n, 0.0);
+    assert!(spectrum.len() >= n);
 
     let mut buffer: Vec<Complex<f32>> = samples
         .iter()

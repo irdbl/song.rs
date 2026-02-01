@@ -1,23 +1,57 @@
-# ggwave
+# sóng
 
-Rust port of [ggwave](https://github.com/ggerganov/ggwave)'s **AUDIBLE_FAST** codec. Encode data into audible sound and decode it back — at 48 kHz, using frequency-shift keying with Reed-Solomon error correction.
+A voice-based acoustic modem that survives noise cancellation.
+
+## The Problem
+
+Acoustic modems like ggwave use pure sine tones. These get destroyed by phone call codecs (AMR, Opus), noise cancellation (Krisp, WebRTC), and speaker-air-microphone chains.
+
+## The Insight
+
+Noise cancellation preserves human voice. So we encode data as voice-like signals — formant positions instead of pure tones, harmonic structure instead of sine waves. If it sounds like speech, it survives.
+
+## How It Works
+
+Data is encoded as a sequence of **vowel-like sounds** using two orthogonal channels:
+
+- **Vowel channel** (3 bits): F1/F2 formant frequencies select one of 8 vowels
+- **Pitch channel** (1 bit): F0 fundamental frequency — 210 Hz (low) or 270 Hz (high)
+
+Each symbol carries 4 bits (16 symbols total), synthesized as a harmonic series (16 harmonics) shaped by Gaussian formant envelopes.
+
+8 machine-optimized vowels (maximizing classification distance across both F0 values):
+
+| Vowel | F1 (Hz) | F2 (Hz) |
+|-------|---------|---------|
+| 0 | 480 | 1065 |
+| 1 | 480 | 1890 |
+| 2 | 480 | 2370 |
+| 3 | 585 | 1410 |
+| 4 | 720 | 1065 |
+| 5 | 720 | 1890 |
+| 6 | 825 | 1410 |
+| 7 | 825 | 2370 |
+
+All F1 values are ≥480 Hz to survive 300 Hz phone highpass filters.
 
 ## Usage
 
+### Single-message API
+
 ```rust
 // Encode
-let audio = ggwave::encode(b"hello", 25).unwrap(); // -> Vec<f32> at 48 kHz
+let audio = ggwave_voice::encode(b"hello", 25).unwrap(); // Vec<f32> at 48 kHz
 
 // Decode
-let mut decoder = ggwave::Decoder::new();
+let mut decoder = ggwave_voice::Decoder::new();
 let payload = decoder.decode(&audio).unwrap().unwrap();
 assert_eq!(&payload, b"hello");
 ```
 
-The decoder is streaming — feed it audio in arbitrary-sized chunks and it returns `Ok(Some(data))` when a complete message is received:
+The decoder is streaming — feed audio in arbitrary-sized chunks:
 
 ```rust
-let mut decoder = ggwave::Decoder::new();
+let mut decoder = ggwave_voice::Decoder::new();
 for chunk in audio.chunks(512) {
     if let Ok(Some(payload)) = decoder.decode(chunk) {
         println!("{}", String::from_utf8_lossy(&payload));
@@ -25,85 +59,141 @@ for chunk in audio.chunks(512) {
 }
 ```
 
-## API
+### Streaming FEC API
 
-### `encode(payload: &[u8], volume: u8) -> Result<Vec<f32>, Error>`
+For continuous data transfer without per-message preamble overhead:
 
-Encodes up to 140 bytes into f32 audio samples at 48 kHz. Volume range is 0–100.
+```rust
+use ggwave_voice::{StreamTx, StreamRx, StreamConfig};
 
-### `Decoder`
+let config = StreamConfig::default(); // RS(15,11), interleave depth 2
 
-- `Decoder::new()` — create a new decoder
-- `decoder.decode(&[f32])` — feed samples, returns `Ok(Some(payload))` on success
-- `decoder.reset()` — reset state for a new message
+// Transmit
+let mut tx = StreamTx::new(config.clone());
+tx.feed(b"streaming data here");
+tx.finish();
+let mut audio = vec![0.0f32; 4096];
+while tx.emit(&mut audio) > 0 {
+    // write audio to speaker
+}
 
-## Robustness
+// Receive
+let mut rx = StreamRx::new(config);
+rx.ingest(&audio);
+let decoded = rx.read_all();
+```
 
-The decoder uses spectral confidence scoring to select the best decode candidate across sub-frame offsets, making it resilient to:
+### PHY layer (reliable delivery)
 
-- 16-bit WAV quantization
-- Additive noise (tolerates ~5% at volume 50)
-- Amplitude clipping and scaling
-- DC offset
-- Leading/trailing silence or noise
-- Degenerate payloads (all-zeros, repeated bytes)
+For reliable delivery over the acoustic channel, the PHY layer adds stop-and-wait ARQ with automatic fragmentation:
 
-All 256 single-byte values and all payload lengths 1–140 round-trip correctly.
+```rust
+use ggwave_voice::phy::{Phy, PhyConfig, PhyEvent};
 
-## Protocol details
+let mut phy = Phy::new(PhyConfig::default());
+
+// Send a message (fragments automatically if > 139 bytes)
+phy.send(b"hello from the other side").unwrap();
+
+// Main loop: feed mic input, pull speaker output, check events
+let mut mic_buf = [0.0f32; 1024];
+let mut spk_buf = [0.0f32; 1024];
+loop {
+    // read_mic(&mut mic_buf);
+    phy.ingest(&mic_buf);
+    phy.emit(&mut spk_buf);
+    // write_speaker(&spk_buf);
+
+    while let Some(event) = phy.poll() {
+        match event {
+            PhyEvent::Received(msg) => println!("got: {:?}", msg),
+            PhyEvent::SendComplete => println!("ACKed"),
+            PhyEvent::SendFailed => println!("gave up"),
+        }
+    }
+    # break; // (example only)
+}
+```
+
+## Architecture
+
+| Module | Purpose |
+|---|---|
+| `src/lib.rs` | Public API (`encode`, `Decoder`), re-exports |
+| `src/protocol.rs` | Constants (sample rate, symbol timing, FFT size, formant bands) |
+| `src/formant.rs` | 2-channel symbol system: vowel alphabet, synthesis, detection, 4-bit packing |
+| `src/encoder.rs` | Payload → RS-encode → symbols → synthesized audio |
+| `src/decoder.rs` | Streaming state machine (Listening → Receiving → Analyzing) |
+| `src/fft.rs` | FFT wrapper (Hann-windowed and raw power spectrum) |
+| `src/reed_solomon.rs` | RS codec over GF(2^8) with erasure support |
+| `src/rs4.rs` | RS codec over GF(2^4) for streaming FEC (symbols = field elements) |
+| `src/stream.rs` | Streaming FEC codec: continuous encode/decode with block interleaving |
+| `src/phy.rs` | PHY layer: stop-and-wait ARQ, fragmentation, ACK/NAK, timeout/retransmit |
+
+## Protocol
 
 | Parameter | Value |
 |---|---|
 | Sample rate | 48,000 Hz |
-| Samples per frame | 1,024 |
-| Max payload | 140 bytes |
-| Error correction | Reed-Solomon (adaptive ECC) |
-| Marker frames | 16 start + 16 end |
-| Frequency base | 1,875 Hz (bin 40) |
-| Frequency spacing | 93.75 Hz |
+| F0 (fundamental) | 210 Hz (low) / 270 Hz (high) |
+| Harmonics | 16 |
+| Symbol duration | 50 ms + 10 ms guard |
+| Symbols | 16 (8 vowels × 2 pitches = 4 bits each) |
+| Preamble | 4 symbols (start + end) |
+| Max payload (single message) | 140 bytes |
+| Error correction | Reed-Solomon GF(2^8), adaptive ECC |
 
-## Benchmarks
+### Streaming FEC
 
-Run with `cargo bench`.
+| Parameter | Default |
+|---|---|
+| Codeword | RS(15,11) over GF(2^4) — 4 parity symbols |
+| Error correction | 2 symbol errors or 4 erasures per codeword |
+| Interleaving | Block interleaver, depth 2 |
+| Throughput | ~6 B/s (3–4× over ARQ) |
+| Configurable | `rs_parity` (2–8), `interleave_depth` (1–4) |
 
-### Protocol bandwidth
+The 4-bit modem symbols are GF(2^4) field elements — RS operates directly on modem symbols with no byte packing between FEC and modulation.
 
-Over-the-air data rate, computed from protocol parameters (not a runtime measurement):
+### PHY (reliable delivery)
 
-| Payload | ECC | Frames | Duration | Bitrate |
-|--------:|----:|-------:|---------:|--------:|
-| 1 B | 2 B | 44 | 0.94 s | 8.5 bit/s |
-| 5 B | 4 B | 56 | 1.19 s | 33.5 bit/s |
-| 10 B | 4 B | 68 | 1.45 s | 55.1 bit/s |
-| 25 B | 10 B | 110 | 2.35 s | 85.2 bit/s |
-| 50 B | 20 B | 182 | 3.88 s | 103.0 bit/s |
-| 100 B | 40 B | 320 | 6.83 s | 117.2 bit/s |
-| 140 B | 56 B | 434 | 9.26 s | 121.0 bit/s |
+| Parameter | Default |
+|---|---|
+| Max message size | 2,224 bytes (16 fragments × 139 bytes) |
+| ACK timeout | 4,000 ms |
+| Max retries | 5 per fragment |
+| Volume | 50 (0–100) |
 
-Larger payloads amortize the fixed 32 marker frames, reaching ~121 bit/s at max size.
+The PHY is a pure state machine — no threads, no timers, no I/O. WASM-compatible.
 
-### Computational throughput
+## Robustness
 
-Encode and decode speed relative to the audio duration they produce/consume (Apple M2):
+163 tests across unit, integration, and channel simulation:
 
-| Payload | Encode | Decode | Roundtrip |
-|--------:|-------:|-------:|----------:|
-| 1 B | 1.8 ms (507x RT) | 7.1 ms (132x RT) | 8.8 ms |
-| 5 B | 1.8 ms (641x RT) | 2.7 ms (437x RT) | 4.5 ms |
-| 10 B | 1.9 ms (766x RT) | 4.0 ms (356x RT) | 5.8 ms |
-| 25 B | 2.0 ms (1138x RT) | 7.7 ms (304x RT) | 9.7 ms |
-| 50 B | 2.3 ms (1659x RT) | 14.3 ms (268x RT) | 16.6 ms |
-| 100 B | 2.7 ms (2505x RT) | 28.2 ms (242x RT) | 30.7 ms |
-| 140 B | 3.0 ms (3004x RT) | 41.6 ms (221x RT) | 44.4 ms |
+- Phone line (300–3400 Hz bandpass + 8 kHz resample + μ-law codec + noise)
+- AM radio (300–2500 Hz bandpass + echo + noise)
+- VoIP narrowband (400–3000 Hz + 8-bit quantization)
+- Neural noise cancellation (RNNoise — Mozilla/Xiph noise suppressor)
+- Hard/soft clipping and saturation
+- Frequency drift (±5 Hz Doppler)
+- Room reverb (multiple echo paths)
+- Wow/flutter (speed wobble)
+- Notch filters (room modes / interference)
+- Signal fading (time-varying gain)
+- Low-resolution ADC (down to 6-bit)
+- Combined nightmare channels (all of the above stacked)
 
-Both encode and decode run >100x faster than real-time at all payload sizes.
+SNR threshold: ~10 dB through a phone channel. Survives RNNoise at ≥20 dB SNR.
+
+All 256 single-byte values and all payload lengths 1–140 round-trip correctly.
 
 ## Dependencies
 
 - [`rustfft`](https://crates.io/crates/rustfft) — FFT computation
 - [`thiserror`](https://crates.io/crates/thiserror) — error types
-- [`hound`](https://crates.io/crates/hound) — WAV I/O (dev only, for tests)
+- [`hound`](https://crates.io/crates/hound) — WAV I/O (dev only)
 - [`criterion`](https://crates.io/crates/criterion) — benchmarking (dev only)
+- [`nnnoiseless`](https://crates.io/crates/nnnoiseless) — RNNoise noise suppression (dev only)
 
 ## License
 

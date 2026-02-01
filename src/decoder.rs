@@ -1,30 +1,35 @@
-//! Decoder: f32 audio samples → payload (AUDIBLE_FAST protocol, streaming).
+//! Decoder: f32 audio samples → payload (2-channel orthogonal vocal modem, streaming).
 
 use crate::fft;
+use crate::formant;
 use crate::protocol::*;
 use crate::reed_solomon::ReedSolomon;
 
-/// Streaming decoder for AUDIBLE_FAST.
+/// Preamble vowel patterns for start detection (vowel-only, robust to misalignment).
+const PREAMBLE_START_VOWELS: [usize; PREAMBLE_LEN] = [0, 7, 0, 7];
+
+/// Preamble vowel patterns for end detection.
+const PREAMBLE_END_VOWELS: [usize; PREAMBLE_LEN] = [7, 0, 7, 0];
+
+/// End preamble full symbol values for precise matching in analyze().
+const PREAMBLE_END_SYMBOLS: [usize; PREAMBLE_LEN] = [14, 0, 14, 0];
+
+/// Number of history windows to keep during Listening for alignment recovery.
+const HISTORY_WINDOWS: usize = 6;
+
+/// Streaming decoder for the 2-channel orthogonal vocal modem.
 pub struct Decoder {
-    /// Rolling amplitude history for spectrum averaging.
-    amplitude_history: Vec<Vec<f32>>,
-    history_id: usize,
-
-    /// Current state.
     state: DecoderState,
-
-    /// Recorded amplitude data during receiving.
-    amplitude_recorded: Vec<f32>,
-    frames_to_record: usize,
-    frames_left_to_record: usize,
-    recv_duration_frames: usize,
-
-    /// Marker detection state.
-    n_markers_success: usize,
-    marker_freq_start: usize,
-
-    /// Accumulation buffer for partial frames.
     sample_buffer: Vec<f32>,
+    recent_vowels: Vec<usize>,
+    recent_symbols: Vec<usize>,
+    recorded_audio: Vec<f32>,
+    symbols_recorded: usize,
+    max_record_symbols: usize,
+    /// Ring buffer of recent windows during Listening for alignment recovery.
+    history: Vec<Vec<f32>>,
+    /// Accumulated classified symbols during Receiving (for best-effort preview).
+    preview_symbols: Vec<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,38 +48,45 @@ impl Default for Decoder {
 impl Decoder {
     pub fn new() -> Self {
         Self {
-            amplitude_history: vec![vec![0.0f32; SAMPLES_PER_FRAME]; MAX_SPECTRUM_HISTORY],
-            history_id: 0,
             state: DecoderState::Listening,
-            amplitude_recorded: Vec::new(),
-            frames_to_record: 0,
-            frames_left_to_record: 0,
-            recv_duration_frames: 0,
-            n_markers_success: 0,
-            marker_freq_start: 0,
             sample_buffer: Vec::new(),
+            recent_vowels: Vec::new(),
+            recent_symbols: Vec::new(),
+            recorded_audio: Vec::new(),
+            symbols_recorded: 0,
+            max_record_symbols: 0,
+            history: Vec::new(),
+            preview_symbols: Vec::new(),
         }
     }
 
-    /// Reset the decoder to initial state.
     pub fn reset(&mut self) {
         *self = Self::new();
     }
 
-    /// Feed audio samples and attempt to decode.
+    /// Best-effort preview of symbols accumulated during the current Receiving phase.
     ///
-    /// Returns `Ok(Some(payload))` when a complete message is decoded,
-    /// `Ok(None)` when more data is needed, or `Err` on decode failure.
+    /// Converts classified (but uncorrected) symbols to raw bytes. Returns None
+    /// if the decoder is not currently receiving or has too few symbols.
+    pub fn preview_bytes(&self) -> Option<Vec<u8>> {
+        if self.state != DecoderState::Receiving || self.preview_symbols.is_empty() {
+            return None;
+        }
+        let max_bytes = (self.preview_symbols.len() * BITS_PER_SYMBOL) / 8;
+        if max_bytes == 0 {
+            return None;
+        }
+        Some(formant::symbols_to_bytes(&self.preview_symbols, max_bytes))
+    }
+
     pub fn decode(&mut self, samples: &[f32]) -> Result<Option<Vec<u8>>, crate::Error> {
-        // Append incoming samples to buffer
         self.sample_buffer.extend_from_slice(samples);
 
-        // Process full frames
-        while self.sample_buffer.len() >= SAMPLES_PER_FRAME {
-            let frame: Vec<f32> = self.sample_buffer[..SAMPLES_PER_FRAME].to_vec();
-            self.sample_buffer.drain(..SAMPLES_PER_FRAME);
+        while self.sample_buffer.len() >= SYMBOL_TOTAL_SAMPLES {
+            let window: Vec<f32> = self.sample_buffer[..SYMBOL_TOTAL_SAMPLES].to_vec();
+            self.sample_buffer.drain(..SYMBOL_TOTAL_SAMPLES);
 
-            let result = self.process_frame(&frame)?;
+            let result = self.process_symbol_window(&window)?;
             if result.is_some() {
                 return Ok(result);
             }
@@ -83,355 +95,293 @@ impl Decoder {
         Ok(None)
     }
 
-    /// Process a single frame of SAMPLES_PER_FRAME samples.
-    fn process_frame(&mut self, amplitude: &[f32]) -> Result<Option<Vec<u8>>, crate::Error> {
-        // Store in history
-        self.amplitude_history[self.history_id][..SAMPLES_PER_FRAME]
-            .copy_from_slice(&amplitude[..SAMPLES_PER_FRAME]);
-        self.history_id = (self.history_id + 1) % MAX_SPECTRUM_HISTORY;
+    fn process_symbol_window(
+        &mut self,
+        window: &[f32],
+    ) -> Result<Option<Vec<u8>>, crate::Error> {
+        match self.state {
+            DecoderState::Listening => {
+                let vowel = self.classify_window_vowel(window);
 
-        // Compute averaged spectrum (when history wraps or receiving)
-        let compute_spectrum =
-            self.history_id == 0 || self.state == DecoderState::Receiving;
-
-        let spectrum = if compute_spectrum {
-            // Average amplitude history
-            let mut avg = vec![0.0f32; SAMPLES_PER_FRAME];
-            for hist in &self.amplitude_history {
-                for (i, &v) in hist.iter().enumerate() {
-                    avg[i] += v;
+                // Keep history for alignment recovery
+                self.history.push(window.to_vec());
+                if self.history.len() > HISTORY_WINDOWS {
+                    self.history.remove(0);
                 }
-            }
-            let norm = 1.0 / MAX_SPECTRUM_HISTORY as f32;
-            for v in avg.iter_mut() {
-                *v *= norm;
-            }
 
-            // FFT -> power spectrum
-            let mut spec = vec![0.0f32; SAMPLES_PER_FRAME];
-            fft::power_spectrum(&avg, &mut spec);
-            Some(spec)
-        } else {
-            None
+                self.recent_vowels.push(vowel);
+                if self.recent_vowels.len() > PREAMBLE_LEN {
+                    self.recent_vowels
+                        .drain(..self.recent_vowels.len() - PREAMBLE_LEN);
+                }
+
+                if self.recent_vowels.len() == PREAMBLE_LEN
+                    && self.recent_vowels[..] == PREAMBLE_START_VOWELS[..]
+                {
+                    self.start_receiving();
+                }
+                Ok(None)
+            }
+            DecoderState::Receiving => {
+                self.recorded_audio.extend_from_slice(window);
+                self.symbols_recorded += 1;
+
+                let voiced = &window[..SAMPLES_PER_SYMBOL.min(window.len())];
+                let (sym, _) = self.classify_voiced_segment(voiced);
+                self.preview_symbols.push(sym);
+                let vowel = formant::symbol_vowel(sym);
+                self.recent_vowels.push(vowel);
+                if self.recent_vowels.len() > PREAMBLE_LEN {
+                    self.recent_vowels
+                        .drain(..self.recent_vowels.len() - PREAMBLE_LEN);
+                }
+                self.recent_symbols.push(sym);
+                if self.recent_symbols.len() > PREAMBLE_LEN {
+                    self.recent_symbols
+                        .drain(..self.recent_symbols.len() - PREAMBLE_LEN);
+                }
+
+                let min_data_symbols = formant::symbols_for_bytes(ENCODED_DATA_OFFSET);
+                // Check full symbol match for end preamble (stronger than vowel-only)
+                let end_detected = (self.recent_symbols.len() == PREAMBLE_LEN
+                    && self.recent_symbols[..] == PREAMBLE_END_SYMBOLS[..])
+                    || (self.recent_vowels.len() == PREAMBLE_LEN
+                        && self.recent_vowels[..] == PREAMBLE_END_VOWELS[..]);
+                if end_detected
+                    && self.symbols_recorded > min_data_symbols + PREAMBLE_LEN
+                {
+                    let trial_n = self.symbols_recorded - PREAMBLE_LEN;
+                    if trial_n >= min_data_symbols {
+                        if let Some(payload) = self.trial_decode(trial_n) {
+                            self.state = DecoderState::Listening;
+                            self.recent_vowels.clear();
+                            self.recent_symbols.clear();
+                            return Ok(Some(payload));
+                        }
+                        // Trial decode failed — likely misaligned due to history
+                        // prepend, or a false positive vowel/symbol match from data.
+                        // Don't transition to Analyzing on first false positive;
+                        // continue receiving to find the real end preamble.
+                    }
+                }
+
+                if self.symbols_recorded >= self.max_record_symbols {
+                    self.state = DecoderState::Analyzing;
+                    return self.analyze();
+                }
+
+                Ok(None)
+            }
+            DecoderState::Analyzing => Ok(None),
+        }
+    }
+
+    fn classify_window_vowel(&self, window: &[f32]) -> usize {
+        let voiced = &window[..SAMPLES_PER_SYMBOL.min(window.len())];
+
+        let rms = {
+            let sum_sq: f64 = voiced.iter().map(|&s| (s as f64) * (s as f64)).sum();
+            (sum_sq / voiced.len() as f64).sqrt()
         };
-
-        // Record frames during receiving
-        if self.state == DecoderState::Receiving && self.frames_left_to_record > 0 {
-            let offset =
-                (self.frames_to_record - self.frames_left_to_record) * SAMPLES_PER_FRAME;
-            if offset + SAMPLES_PER_FRAME <= self.amplitude_recorded.len() {
-                self.amplitude_recorded[offset..offset + SAMPLES_PER_FRAME]
-                    .copy_from_slice(amplitude);
-            }
-            self.frames_left_to_record -= 1;
-            if self.frames_left_to_record == 0 {
-                self.state = DecoderState::Analyzing;
-            }
+        if rms < 1e-6 {
+            return NUM_VOWELS;
         }
 
-        // Analyze recorded data
-        if self.state == DecoderState::Analyzing {
-
-            let result = self.analyze();
-            self.state = DecoderState::Listening;
-            self.frames_to_record = 0;
-            self.n_markers_success = 0;
-            return result;
-        }
-
-        // Marker detection
-        if let Some(ref spec) = spectrum {
-            if self.state == DecoderState::Listening {
-                self.detect_start_marker(spec);
-            } else if self.state == DecoderState::Receiving {
-                self.detect_end_marker(spec);
-            }
-        }
-
-        Ok(None)
+        let mut spectrum = vec![0.0f32; voiced.len()];
+        fft::power_spectrum_raw(voiced, &mut spectrum);
+        let f0 = formant::detect_f0(&spectrum);
+        let (f1, f2) = formant::detect_formants(&spectrum, f0);
+        let (vowel_idx, _) = formant::classify_vowel(f1, f2);
+        vowel_idx
     }
 
-    /// Check for start marker pattern in spectrum.
-    fn detect_start_marker(&mut self, spectrum: &[f32]) {
-        let mut n_detected = N_BITS_IN_MARKER;
-
-        for i in 0..N_BITS_IN_MARKER {
-            let freq = bit_freq(i);
-            let bin = (freq * IHZ_PER_SAMPLE).round() as usize;
-
-            if bin + FREQ_DELTA_BIN >= spectrum.len() {
-                n_detected = 0;
-                break;
-            }
-
-            // Start marker: even bits have bit1 (higher power at bin),
-            // odd bits have bit0 (higher power at bin + delta)
-            if i % 2 == 0 {
-                if spectrum[bin]
-                    <= SOUND_MARKER_THRESHOLD as f32 * spectrum[bin + FREQ_DELTA_BIN]
-                {
-                    n_detected -= 1;
-                }
-            } else if spectrum[bin]
-                >= SOUND_MARKER_THRESHOLD as f32 * spectrum[bin + FREQ_DELTA_BIN]
-            {
-                n_detected -= 1;
-            }
-        }
-
-        if n_detected == N_BITS_IN_MARKER {
-            self.marker_freq_start = FREQ_START;
-            self.n_markers_success += 1;
-
-            if self.n_markers_success >= 1 {
-
-                self.start_receiving();
-            }
-        } else {
-            self.n_markers_success = 0;
-        }
+    fn classify_voiced_segment(&self, voiced: &[f32]) -> (usize, f64) {
+        let mut spectrum = vec![0.0f32; voiced.len()];
+        fft::power_spectrum(voiced, &mut spectrum);
+        formant::classify_symbol(&spectrum)
     }
 
-    /// Check for end marker pattern in spectrum.
-    fn detect_end_marker(&mut self, spectrum: &[f32]) {
-        let mut n_detected = N_BITS_IN_MARKER;
-
-        for i in 0..N_BITS_IN_MARKER {
-            let freq = bit_freq(i);
-            let bin = (freq * IHZ_PER_SAMPLE).round() as usize;
-
-            if bin + FREQ_DELTA_BIN >= spectrum.len() {
-                n_detected = 0;
-                break;
-            }
-
-            // End marker: inverted pattern from start marker
-            if i % 2 == 0 {
-                if spectrum[bin]
-                    >= SOUND_MARKER_THRESHOLD as f32 * spectrum[bin + FREQ_DELTA_BIN]
-                {
-                    n_detected -= 1;
-                }
-            } else if spectrum[bin]
-                <= SOUND_MARKER_THRESHOLD as f32 * spectrum[bin + FREQ_DELTA_BIN]
-            {
-                n_detected -= 1;
-            }
-        }
-
-        if n_detected == N_BITS_IN_MARKER {
-            self.n_markers_success += 1;
-
-            if self.n_markers_success >= 3 && self.frames_to_record > 1 {
-                self.recv_duration_frames -= self.frames_left_to_record.saturating_sub(1);
-                self.frames_left_to_record = 1;
-                self.n_markers_success = 0;
-            }
-        } else {
-            self.n_markers_success = 0;
-        }
-    }
-
-    /// Transition to receiving state.
     fn start_receiving(&mut self) {
         self.state = DecoderState::Receiving;
-        self.n_markers_success = 0;
+        self.recent_vowels.clear();
+        self.recent_symbols.clear();
+        self.preview_symbols.clear();
 
-        // Max receive duration
+        // Prepend history windows to recording for alignment recovery
+        self.recorded_audio.clear();
+        let n_history = self.history.len();
+        for w in &self.history {
+            self.recorded_audio.extend_from_slice(w);
+        }
+        self.symbols_recorded = n_history;
+        self.history.clear();
+
         let max_total_bytes =
-            MAX_LENGTH_VARIABLE + ecc_bytes_for_length(MAX_LENGTH_VARIABLE);
-        let max_data_frames =
-            FRAMES_PER_TX * ((max_total_bytes / BYTES_PER_TX) + 1);
-        self.recv_duration_frames = 2 * N_MARKER_FRAMES + max_data_frames;
+            ENCODED_DATA_OFFSET + MAX_LENGTH_VARIABLE + ecc_bytes_for_length(MAX_LENGTH_VARIABLE);
+        let max_data_syms = formant::symbols_for_bytes(max_total_bytes);
+        self.max_record_symbols = max_data_syms + PREAMBLE_LEN + n_history + 10;
 
-        self.frames_to_record = self.recv_duration_frames;
-        self.frames_left_to_record = self.recv_duration_frames;
-        self.amplitude_recorded =
-            vec![0.0f32; self.recv_duration_frames * SAMPLES_PER_FRAME];
+        self.recorded_audio
+            .reserve(self.max_record_symbols * SYMBOL_TOTAL_SAMPLES);
     }
 
-    /// Analyze recorded data to extract payload.
-    ///
-    /// Scans all sub-frame offsets, collects valid decode candidates with
-    /// spectral confidence scores, and returns the highest-confidence result.
-    fn analyze(&mut self) -> Result<Option<Vec<u8>>, crate::Error> {
-        let steps_per_frame: usize = 16;
-        let step = SAMPLES_PER_FRAME / steps_per_frame;
+    fn trial_decode(&self, n_data_symbols: usize) -> Option<Vec<u8>> {
+        let mut symbols = Vec::with_capacity(n_data_symbols);
+        let mut confidences = Vec::with_capacity(n_data_symbols);
 
-        // Only try AUDIBLE_FAST (freqStart == marker_freq_start)
-        if self.marker_freq_start != FREQ_START {
-            return Ok(None);
+        for i in 0..n_data_symbols {
+            let s = i * SYMBOL_TOTAL_SAMPLES;
+            if s + SAMPLES_PER_SYMBOL > self.recorded_audio.len() {
+                return None;
+            }
+            let voiced = &self.recorded_audio[s..s + SAMPLES_PER_SYMBOL];
+            let (sym, conf) = self.classify_voiced_segment(voiced);
+            symbols.push(sym);
+            confidences.push(conf);
         }
 
-        let mut spectrum = vec![0.0f32; SAMPLES_PER_FRAME];
+        // Skip past start preamble if present in the recorded symbols
+        // (history windows prepended in start_receiving may include it)
+        let min_data_symbols = formant::symbols_for_bytes(ENCODED_DATA_OFFSET);
+        let mut data_start = 0;
+        if symbols.len() >= PREAMBLE_LEN + min_data_symbols {
+            for pos in 0..symbols.len().saturating_sub(min_data_symbols + PREAMBLE_LEN) {
+                let vowels: Vec<usize> = symbols[pos..pos + PREAMBLE_LEN]
+                    .iter()
+                    .map(|&s| formant::symbol_vowel(s))
+                    .collect();
+                if vowels == PREAMBLE_START_VOWELS {
+                    data_start = pos + PREAMBLE_LEN;
+                    break;
+                }
+            }
+        }
 
-        // Track best candidate across all sub-frame offsets
+        self.try_decode_symbols(&symbols[data_start..], Some(&confidences[data_start..]))
+    }
+
+    fn analyze(&mut self) -> Result<Option<Vec<u8>>, crate::Error> {
+        let min_data_symbols = formant::symbols_for_bytes(ENCODED_DATA_OFFSET);
+        if self.symbols_recorded < min_data_symbols {
+            self.state = DecoderState::Listening;
+            self.recent_vowels.clear();
+            return Err(crate::Error::DecodeFailed);
+        }
+
+        let total_audio_len = self.recorded_audio.len();
+        let steps_per_symbol: usize = 16;
+        let step = SYMBOL_TOTAL_SAMPLES / steps_per_symbol;
+
         let mut best_payload: Option<Vec<u8>> = None;
         let mut best_confidence: f64 = 0.0;
-        let mut best_decoded_length: usize = 0;
-        let mut offsets_since_first_valid: usize = 0;
-        let mut found_any_valid = false;
 
-        // Try each sub-frame offset
-        for ii in (0..N_MARKER_FRAMES * steps_per_frame).rev() {
-            // Early exit after scanning enough offsets past the first valid decode.
-            // For short payloads (<=4 bytes), scan all offsets because false-positive
-            // RS decodes are more likely. For longer payloads, use a bounded window.
-            if found_any_valid {
-                offsets_since_first_valid += 1;
-                if best_decoded_length > 4 && offsets_since_first_valid > 3 * steps_per_frame {
+        // Try more offsets to handle misalignment from padding
+        let max_offset_steps = steps_per_symbol * 2;
+
+        for offset_step in 0..max_offset_steps {
+            let sample_offset = offset_step * step;
+
+            let mut symbols = Vec::new();
+            let mut confidences = Vec::new();
+            let mut confidence_sum = 0.0f64;
+            let mut sym_idx = 0;
+
+            loop {
+                let start = sample_offset + sym_idx * SYMBOL_TOTAL_SAMPLES;
+                if start + SAMPLES_PER_SYMBOL > total_audio_len {
+                    break;
+                }
+
+                let voiced = &self.recorded_audio[start..start + SAMPLES_PER_SYMBOL];
+                let (sym, conf) = self.classify_voiced_segment(voiced);
+                symbols.push(sym);
+                confidences.push(conf);
+                confidence_sum += conf;
+                sym_idx += 1;
+            }
+
+            if symbols.len() < min_data_symbols {
+                continue;
+            }
+
+            // Try to find and strip start preamble from front
+            let mut data_start = 0;
+            if symbols.len() >= PREAMBLE_LEN {
+                for pos in 0..symbols.len().saturating_sub(min_data_symbols + PREAMBLE_LEN) {
+                    let vowels: Vec<usize> = symbols[pos..pos + PREAMBLE_LEN]
+                        .iter()
+                        .map(|&s| formant::symbol_vowel(s))
+                        .collect();
+                    if vowels == PREAMBLE_START_VOWELS {
+                        data_start = pos + PREAMBLE_LEN;
+                        break;
+                    }
+                }
+            }
+
+            // Collect candidate end positions for data region:
+            // 1. Full 4-bit symbol match (most precise)
+            // 2. Vowel-only match (works with degraded envelope/voicing)
+            // 3. No end-preamble stripping (fallback)
+            let end_preamble_vowels: [usize; PREAMBLE_LEN] = [7, 0, 7, 0];
+            let mut end_candidates = Vec::new();
+
+            for pos in (data_start + min_data_symbols..=symbols.len().saturating_sub(PREAMBLE_LEN)).rev() {
+                if pos + PREAMBLE_LEN > symbols.len() { continue; }
+                if symbols[pos..pos + PREAMBLE_LEN] == PREAMBLE_END_SYMBOLS {
+                    end_candidates.push(pos);
                     break;
                 }
             }
 
-            let offset_start = ii;
-
-            let mut data_encoded = vec![0u8; MAX_DATA_SIZE];
-            let mut confidence_sum: f64 = 0.0;
-            let mut confidence_count: usize = 0;
-
-            // Collect all nibble data first, then try to decode
-            let max_itx = {
-                let mut max = 0;
-                for itx in 0..1024 {
-                    let offset_tx =
-                        offset_start + itx * FRAMES_PER_TX * steps_per_frame;
-
-                    if offset_tx >= self.recv_duration_frames * steps_per_frame {
-                        break;
+            for pos in (data_start + min_data_symbols..=symbols.len().saturating_sub(PREAMBLE_LEN)).rev() {
+                if pos + PREAMBLE_LEN > symbols.len() { continue; }
+                let vowels: Vec<usize> = symbols[pos..pos + PREAMBLE_LEN]
+                    .iter()
+                    .map(|&s| formant::symbol_vowel(s))
+                    .collect();
+                if vowels == end_preamble_vowels {
+                    if !end_candidates.contains(&pos) {
+                        end_candidates.push(pos);
                     }
-                    if (itx + 1) * BYTES_PER_TX >= MAX_DATA_SIZE {
-                        break;
-                    }
-
-                    // Sum frames for this TX chunk
-                    let sample_start = offset_tx * step;
-                    if sample_start + SAMPLES_PER_FRAME > self.amplitude_recorded.len() {
-                        break;
-                    }
-
-                    let mut fft_buf = vec![0.0f32; SAMPLES_PER_FRAME];
-                    fft_buf.copy_from_slice(
-                        &self.amplitude_recorded[sample_start..sample_start + SAMPLES_PER_FRAME],
-                    );
-
-                    for k in 1..FRAMES_PER_TX {
-                        let koffset = (offset_tx + k * steps_per_frame) * step;
-                        if koffset + SAMPLES_PER_FRAME > self.amplitude_recorded.len() {
-                            break;
-                        }
-                        for i in 0..SAMPLES_PER_FRAME {
-                            fft_buf[i] += self.amplitude_recorded[koffset + i];
-                        }
-                    }
-
-                    // FFT -> power spectrum
-                    fft::power_spectrum(&fft_buf, &mut spectrum);
-
-                    // Extract nibbles with confidence scoring
-                    for i in 0..(2 * BYTES_PER_TX) {
-                        let freq = HZ_PER_SAMPLE * FREQ_START as f64;
-                        let bin = (freq * IHZ_PER_SAMPLE).round() as usize + 16 * i;
-
-                        let mut kmax = 0usize;
-                        let mut amax = 0.0f32;
-                        let mut second_max = 0.0f32;
-                        for k in 0..16 {
-                            if bin + k < spectrum.len() {
-                                let val = spectrum[bin + k];
-                                if val > amax {
-                                    second_max = amax;
-                                    kmax = k;
-                                    amax = val;
-                                } else if val > second_max {
-                                    second_max = val;
-                                }
-                            }
-                        }
-
-                        // Confidence: peak^2 / second_peak.
-                        if second_max > 0.0 {
-                            confidence_sum += (amax as f64 * amax as f64) / second_max as f64;
-                        } else if amax > 0.0 {
-                            confidence_sum += amax as f64 * amax as f64;
-                        }
-                        confidence_count += 1;
-
-                        if i % 2 != 0 {
-                            let byte_idx = itx * BYTES_PER_TX + i / 2;
-                            if byte_idx < data_encoded.len() {
-                                data_encoded[byte_idx] |= (kmax as u8) << 4;
-                            }
-                        } else {
-                            let byte_idx = itx * BYTES_PER_TX + i / 2;
-                            if byte_idx < data_encoded.len() {
-                                data_encoded[byte_idx] =
-                                    (data_encoded[byte_idx] & 0xF0) | (kmax as u8);
-                            }
-                        }
-                    }
-
-                    max = itx + 1;
+                    break;
                 }
-                max
-            };
-
-            if max_itx == 0 {
-                continue;
             }
 
-            // Try to decode the length from the first 3 bytes
-            let rs_length = ReedSolomon::new(1, ENCODED_DATA_OFFSET - 1);
-            let decoded_length = if let Some(decoded) =
-                rs_length.decode(&data_encoded[..ENCODED_DATA_OFFSET])
-            {
-                let len = decoded[0] as usize;
-                if len > 0 && len <= MAX_LENGTH_VARIABLE {
-                    // Ensure we have enough TX chunks extracted
-                    let n_total_bytes_expected =
-                        ENCODED_DATA_OFFSET + len + ecc_bytes_for_length(len);
-                    let n_total_tx = (n_total_bytes_expected + BYTES_PER_TX - 1) / BYTES_PER_TX;
-                    if max_itx >= n_total_tx {
+            end_candidates.push(symbols.len());
 
-                        Some(len)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-
-            if let Some(decoded_length) = decoded_length {
-                let n_ecc = ecc_bytes_for_length(decoded_length);
-                let rs_data = ReedSolomon::new(decoded_length, n_ecc);
-
-                let data_start = ENCODED_DATA_OFFSET;
-                let data_end = data_start + decoded_length + n_ecc;
-
-                if data_end <= data_encoded.len() {
-                    if let Some(decoded) = rs_data.decode(&data_encoded[data_start..data_end]) {
-                        let avg_confidence = if confidence_count > 0 {
-                            confidence_sum / confidence_count as f64
-                        } else {
-                            0.0
-                        };
-
-                        if avg_confidence > best_confidence {
-                            best_confidence = avg_confidence;
-                            best_payload = Some(decoded);
-                            best_decoded_length = decoded_length;
+            for &data_end in &end_candidates {
+                let data_symbols = &symbols[data_start..data_end];
+                let data_confs = &confidences[data_start..data_end];
+                if data_symbols.len() >= min_data_symbols {
+                    if let Some(payload) = self.try_decode_symbols(data_symbols, Some(data_confs)) {
+                        let conf = confidence_sum / symbols.len().max(1) as f64;
+                        if best_payload.is_none() || conf > best_confidence {
+                            best_confidence = conf;
+                            best_payload = Some(payload);
                         }
-                        if !found_any_valid {
-                            found_any_valid = true;
-                            offsets_since_first_valid = 0;
+                    }
+                }
+
+                // Also try without start preamble stripping
+                if data_start > 0 {
+                    let data_symbols = &symbols[..data_end];
+                    let data_confs = &confidences[..data_end];
+                    if data_symbols.len() >= min_data_symbols {
+                        if let Some(payload) = self.try_decode_symbols(data_symbols, Some(data_confs)) {
+                            let conf = confidence_sum / symbols.len().max(1) as f64;
+                            if best_payload.is_none() || conf > best_confidence {
+                                best_confidence = conf;
+                                best_payload = Some(payload);
+                            }
                         }
                     }
                 }
             }
         }
+
+        self.state = DecoderState::Listening;
+        self.recent_vowels.clear();
 
         if let Some(payload) = best_payload {
             Ok(Some(payload))
@@ -439,4 +389,110 @@ impl Decoder {
             Err(crate::Error::DecodeFailed)
         }
     }
+
+    fn try_decode_symbols(
+        &self,
+        symbols: &[usize],
+        confidences: Option<&[f64]>,
+    ) -> Option<Vec<u8>> {
+        if symbols.is_empty() {
+            return None;
+        }
+
+        let min_len_symbols = formant::symbols_for_bytes(ENCODED_DATA_OFFSET);
+        if symbols.len() < min_len_symbols {
+            return None;
+        }
+
+        let max_bytes = (symbols.len() * BITS_PER_SYMBOL) / 8;
+        let data_encoded = formant::symbols_to_bytes(symbols, max_bytes);
+
+        if data_encoded.len() < ENCODED_DATA_OFFSET {
+            return None;
+        }
+
+        // Decode length block: try hard-decision first, then erasure fallback
+        let rs_length = ReedSolomon::new(1, ENCODED_DATA_OFFSET - 1);
+        let decoded_len_byte = rs_length
+            .decode(&data_encoded[..ENCODED_DATA_OFFSET])
+            .or_else(|| {
+                let confs = confidences?;
+                let erasures = compute_byte_erasures(confs, 0, ENCODED_DATA_OFFSET, ENCODED_DATA_OFFSET - 1);
+                if erasures.is_empty() {
+                    return None;
+                }
+                rs_length.decode_with_erasures(&data_encoded[..ENCODED_DATA_OFFSET], &erasures)
+            })?;
+        let len = decoded_len_byte[0] as usize;
+
+        if len == 0 || len > MAX_LENGTH_VARIABLE {
+            return None;
+        }
+
+        let n_ecc = ecc_bytes_for_length(len);
+        let expected_total = ENCODED_DATA_OFFSET + len + n_ecc;
+
+        if data_encoded.len() < expected_total {
+            return None;
+        }
+
+        // Decode payload block: try hard-decision first, then erasure fallback
+        let rs_data = ReedSolomon::new(len, n_ecc);
+        let payload_block = &data_encoded[ENCODED_DATA_OFFSET..ENCODED_DATA_OFFSET + len + n_ecc];
+        let decoded = rs_data.decode(payload_block).or_else(|| {
+            let confs = confidences?;
+            // Symbol offset for the payload block: ENCODED_DATA_OFFSET bytes = symbols starting
+            // at symbol index (ENCODED_DATA_OFFSET * 8 / BITS_PER_SYMBOL)
+            let sym_offset = formant::symbols_for_bytes(ENCODED_DATA_OFFSET);
+            let erasures = compute_byte_erasures(confs, sym_offset, len + n_ecc, n_ecc);
+            if erasures.is_empty() {
+                return None;
+            }
+            rs_data.decode_with_erasures(payload_block, &erasures)
+        })?;
+
+        Some(decoded)
+    }
+}
+
+/// Confidence threshold below which a symbol is considered unreliable.
+/// Normalized confidence is 0..1; weaker symbols cluster below ~0.3.
+const ERASURE_CONFIDENCE_THRESHOLD: f64 = 0.35;
+
+/// Convert per-symbol confidences to byte-level RS erasure positions.
+///
+/// Each byte is packed from 2 symbols (high nibble, low nibble).
+/// Byte confidence = min of its two symbol confidences.
+/// Returns positions of the weakest bytes (below threshold), capped at
+/// `ecc_len / 2` to leave room for hard error correction.
+fn compute_byte_erasures(
+    symbol_confidences: &[f64],
+    sym_offset: usize,
+    num_bytes: usize,
+    ecc_len: usize,
+) -> Vec<usize> {
+    let max_erasures = ecc_len / 2;
+    if max_erasures == 0 {
+        return Vec::new();
+    }
+
+    // Each byte comes from 2 symbols (4 bits each = 8 bits per byte)
+    let mut byte_confs: Vec<(usize, f64)> = (0..num_bytes)
+        .map(|byte_idx| {
+            let sym_base = sym_offset + byte_idx * 2;
+            let c0 = symbol_confidences.get(sym_base).copied().unwrap_or(0.0);
+            let c1 = symbol_confidences.get(sym_base + 1).copied().unwrap_or(0.0);
+            (byte_idx, c0.min(c1))
+        })
+        .collect();
+
+    // Sort by confidence ascending (weakest first)
+    byte_confs.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    byte_confs
+        .iter()
+        .filter(|(_, conf)| *conf < ERASURE_CONFIDENCE_THRESHOLD)
+        .take(max_erasures)
+        .map(|(pos, _)| *pos)
+        .collect()
 }

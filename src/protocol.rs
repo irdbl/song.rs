@@ -1,70 +1,77 @@
 /// Sample rate in Hz.
-pub const SAMPLE_RATE: f32 = 48000.0;
+pub const SAMPLE_RATE: f64 = 48000.0;
 
-/// Number of samples per FFT frame.
-pub const SAMPLES_PER_FRAME: usize = 1024;
+/// Low fundamental frequency (harmonics at 420, 630, 840 Hz — within phone band).
+pub const F0_LOW: f64 = 210.0;
 
-/// Frequency resolution: SAMPLE_RATE / SAMPLES_PER_FRAME = 46.875 Hz per bin.
-pub const HZ_PER_SAMPLE: f64 = SAMPLE_RATE as f64 / SAMPLES_PER_FRAME as f64;
+/// High fundamental frequency (harmonics at 540, 810, 1080 Hz — within phone band).
+pub const F0_HIGH: f64 = 270.0;
 
-/// Inverse of HZ_PER_SAMPLE.
-pub const IHZ_PER_SAMPLE: f64 = 1.0 / HZ_PER_SAMPLE;
+/// Pitch threshold: below = low, above = high (midpoint of 210/270).
+pub const PITCH_THRESHOLD: f64 = 240.0;
 
-/// FFT bin index of the lowest frequency used by AUDIBLE_FAST.
-pub const FREQ_START: usize = 40;
+/// Number of harmonics in the synthesis model (H1=F0 .. H16=16*F0).
+pub const NUM_HARMONICS: usize = 16;
 
-/// Number of frames transmitted per chunk of data.
-pub const FRAMES_PER_TX: usize = 6;
+/// Samples per symbol (50 ms at 48 kHz).
+pub const SAMPLES_PER_SYMBOL: usize = 2400;
 
-/// Number of bytes per transmitted chunk.
-pub const BYTES_PER_TX: usize = 3;
+/// Guard silence after each symbol (10 ms).
+pub const GUARD_SAMPLES: usize = 480;
 
-/// Extra factor (1 = standard, 2 = mono-tone). AUDIBLE protocols use 1.
-pub const EXTRA: usize = 1;
+/// Total samples per symbol slot (symbol + guard).
+pub const SYMBOL_TOTAL_SAMPLES: usize = SAMPLES_PER_SYMBOL + GUARD_SAMPLES; // 2880
 
-/// Number of tones per transmission = (2 * BYTES_PER_TX) / EXTRA.
-pub const N_TONES: usize = (2 * BYTES_PER_TX) / EXTRA;
+/// Number of vowel shapes in the alphabet.
+pub const NUM_VOWELS: usize = 8;
 
-/// Number of data bits per transmission = 8 * BYTES_PER_TX.
-pub const N_DATA_BITS_PER_TX: usize = 8 * BYTES_PER_TX;
+/// Number of pitch classes.
+pub const NUM_PITCHES: usize = 2;
 
-/// Bin spacing between bit0 and bit1 frequencies for a tone.
-pub const FREQ_DELTA_BIN: usize = 1;
+/// Total symbol alphabet size (8 * 2 = 16).
+pub const NUM_SYMBOLS: usize = NUM_VOWELS * NUM_PITCHES;
 
-/// Hz spacing = 2 * HZ_PER_SAMPLE.
-pub const FREQ_DELTA_HZ: f64 = 2.0 * HZ_PER_SAMPLE;
+/// Bits per symbol (log2(16) = 4).
+pub const BITS_PER_SYMBOL: usize = 4;
 
-/// Number of bits used in marker detection.
-pub const N_BITS_IN_MARKER: usize = 16;
+/// Preamble length in symbols.
+pub const PREAMBLE_LEN: usize = 4;
 
-/// Number of frames for start/end markers.
-pub const N_MARKER_FRAMES: usize = 16;
+/// FFT size for spectral analysis (same as symbol length).
+pub const FFT_SIZE: usize = SAMPLES_PER_SYMBOL;
+
+/// Hz per FFT bin = SAMPLE_RATE / FFT_SIZE.
+pub const HZ_PER_BIN: f64 = SAMPLE_RATE / FFT_SIZE as f64;
+
+/// Formant bandwidth for F1 (Hz) — Gaussian sigma.
+pub const BW1: f64 = 80.0;
+
+/// Formant bandwidth for F2 (Hz) — Gaussian sigma.
+pub const BW2: f64 = 120.0;
+
+/// F1 band lower bound (Hz) — above 300 Hz phone cutoff.
+pub const F1_LO: f64 = 300.0;
+
+/// F1 band upper bound (Hz).
+pub const F1_HI: f64 = 850.0;
+
+/// F2 band lower bound (Hz).
+pub const F2_LO: f64 = 850.0;
+
+/// F2 band upper bound (Hz).
+pub const F2_HI: f64 = 2500.0;
+
+/// Candidate F0 values for multi-F0 detection in decoder (3 per pitch cluster).
+pub const F0_CANDIDATES: [f64; 6] = [200.0, 210.0, 220.0, 260.0, 270.0, 280.0];
 
 /// Encoded data offset (1 byte length + 2 bytes ECC for length).
 pub const ENCODED_DATA_OFFSET: usize = 3;
-
-/// Sound marker detection threshold.
-pub const SOUND_MARKER_THRESHOLD: f64 = 3.0;
 
 /// Maximum variable-length payload size.
 pub const MAX_LENGTH_VARIABLE: usize = 140;
 
 /// Maximum total encoded data size.
 pub const MAX_DATA_SIZE: usize = 256;
-
-/// Maximum number of recorded frames for variable-length decoding.
-pub const MAX_RECORDED_FRAMES: usize = 2048;
-
-/// Number of spectrum history frames for averaging.
-pub const MAX_SPECTRUM_HISTORY: usize = 4;
-
-/// Compute the frequency (in Hz) for a given bit index within a protocol.
-///
-/// bit_freq = HZ_PER_SAMPLE * FREQ_START + FREQ_DELTA_HZ * bit
-#[inline]
-pub fn bit_freq(bit: usize) -> f64 {
-    HZ_PER_SAMPLE * FREQ_START as f64 + FREQ_DELTA_HZ * bit as f64
-}
 
 /// Compute ECC byte count for a given payload length.
 ///
