@@ -6,12 +6,12 @@
 //!
 //! Usage: cargo run --example sweep_duration --release
 
-use ggwave_voice::formant::{
+use song_rs::formant::{
     self, classify_vowel, detect_pitch, harmonic_amplitudes, params_to_symbol, symbol_to_params,
     symbol_vowel, PREAMBLE_END, PREAMBLE_START, VOWELS,
 };
-use ggwave_voice::protocol::*;
-use ggwave_voice::reed_solomon::ReedSolomon;
+use song_rs::protocol::*;
+use song_rs::reed_solomon::ReedSolomon;
 use rustfft::{num_complex::Complex, FftPlanner};
 use std::f64::consts::PI;
 

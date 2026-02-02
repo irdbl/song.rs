@@ -9,8 +9,8 @@
 //!
 //! Run: cargo run --example optimize_vowels --release
 
-use ggwave_voice::formant;
-use ggwave_voice::protocol::*;
+use song_rs::formant;
+use song_rs::protocol::*;
 use std::collections::HashSet;
 
 // ── Data types ───────────────────────────────────────────────────────

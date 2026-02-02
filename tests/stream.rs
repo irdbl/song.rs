@@ -1,7 +1,7 @@
 //! Stream FEC integration tests: loopback encode → audio → decode.
 
-use ggwave_voice::{StreamTx, StreamRx, StreamConfig};
-use ggwave_voice::rs4::ReedSolomon4;
+use song_rs::{StreamTx, StreamRx, StreamConfig};
+use song_rs::rs4::ReedSolomon4;
 
 // --- RS4 unit tests (codec-level, no audio) ---
 
