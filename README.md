@@ -1,6 +1,7 @@
 # sóng
+*sống* 🌊
 
-A voice-based acoustic modem that survives noise cancellation.
+Data as song. Survives noise cancellation.
 
 ## The Problem
 
@@ -15,24 +16,24 @@ Noise cancellation preserves human voice. So we encode data as voice-like signal
 Data is encoded as a sequence of **vowel-like sounds** using two orthogonal channels:
 
 - **Vowel channel** (3 bits): F1/F2 formant frequencies select one of 8 vowels
-- **Pitch channel** (1 bit): F0 fundamental frequency — 210 Hz (low) or 270 Hz (high)
+- **Pitch channel** (1 bit): F0 fundamental frequency — 208 Hz G#3 (low) or 277 Hz C#4 (high), a perfect fourth
 
 Each symbol carries 4 bits (16 symbols total), synthesized as a harmonic series (16 harmonics) shaped by Gaussian formant envelopes.
 
 8 machine-optimized vowels (maximizing classification distance across both F0 values):
 
-| Vowel | F1 (Hz) | F2 (Hz) |
-|-------|---------|---------|
-| 0 | 480 | 1065 |
-| 1 | 480 | 1890 |
-| 2 | 480 | 2370 |
-| 3 | 585 | 1410 |
-| 4 | 720 | 1065 |
-| 5 | 720 | 1890 |
-| 6 | 825 | 1410 |
-| 7 | 825 | 2370 |
+| Vowel | F1 (Hz) | F2 (Hz) | IPA | as in |
+|-------|---------|---------|-----|-------|
+| 0 | 485 | 1074 | o | g**o** |
+| 1 | 485 | 2010 | e | b**ay** |
+| 2 | 485 | 2495 | i | b**ee** |
+| 3 | 589 | 1559 | ə | **a**bout |
+| 4 | 728 | 1074 | ɔ | l**aw** |
+| 5 | 728 | 2010 | ɛ | b**e**d |
+| 6 | 832 | 1559 | ʌ | b**u**t |
+| 7 | 832 | 2495 | æ | b**a**t |
 
-All F1 values are ≥480 Hz to survive 300 Hz phone highpass filters.
+All F1 values are ≥485 Hz to survive 300 Hz phone highpass filters.
 
 ## Listen
 
@@ -163,7 +164,7 @@ loop {
 | Parameter | Value |
 |---|---|
 | Sample rate | 48,000 Hz |
-| F0 (fundamental) | 210 Hz (low) / 270 Hz (high) |
+| F0 (fundamental) | 208 Hz G#3 / 277 Hz C#4 (perfect fourth) |
 | Harmonics | 16 |
 | Symbol duration | 50 ms + 10 ms guard |
 | Symbols | 16 (8 vowels × 2 pitches = 4 bits each) |

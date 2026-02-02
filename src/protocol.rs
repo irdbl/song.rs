@@ -1,14 +1,14 @@
 /// Sample rate in Hz.
 pub const SAMPLE_RATE: f64 = 48000.0;
 
-/// Low fundamental frequency (harmonics at 420, 630, 840 Hz — within phone band).
-pub const F0_LOW: f64 = 210.0;
+/// Low fundamental frequency (G#3 = 208 Hz).
+pub const F0_LOW: f64 = 208.0;
 
-/// High fundamental frequency (harmonics at 540, 810, 1080 Hz — within phone band).
-pub const F0_HIGH: f64 = 270.0;
+/// High fundamental frequency (C#4 = 277 Hz, perfect fourth above G#3).
+pub const F0_HIGH: f64 = 277.0;
 
-/// Pitch threshold: below = low, above = high (midpoint of 210/270).
-pub const PITCH_THRESHOLD: f64 = 240.0;
+/// Pitch threshold: below = low, above = high (midpoint of 208/277).
+pub const PITCH_THRESHOLD: f64 = 242.5;
 
 /// Number of harmonics in the synthesis model (H1=F0 .. H16=16*F0).
 pub const NUM_HARMONICS: usize = 16;
@@ -62,7 +62,7 @@ pub const F2_LO: f64 = 850.0;
 pub const F2_HI: f64 = 2500.0;
 
 /// Candidate F0 values for multi-F0 detection in decoder (3 per pitch cluster).
-pub const F0_CANDIDATES: [f64; 6] = [200.0, 210.0, 220.0, 260.0, 270.0, 280.0];
+pub const F0_CANDIDATES: [f64; 6] = [198.0, 208.0, 218.0, 267.0, 277.0, 287.0];
 
 /// Encoded data offset (1 byte length + 2 bytes ECC for length).
 pub const ENCODED_DATA_OFFSET: usize = 3;
